@@ -25,7 +25,8 @@ def test_analyze_pcapng_upload(capture_file):
     assert body["filename"] == "mixed.pcapng"
     assert body["summary"]["packets"] == len(pkts)
     assert {p["name"] for p in body["protocols"]} == {"TCP", "DNS", "ARP", "ICMP"}
-    assert "port_scan" in {a["detector"] for a in body["alerts"]}
+    assert [a["detector"] for a in body["alerts"]] == ["arp_spoof", "dns_spoof", "port_scan"]
+    assert all(d["implemented"] for d in body["detectors"])
     assert body["timeline"]["points"]
 
 
