@@ -1,0 +1,14 @@
+# Python
+backend/.venv/
+__pycache__/
+.pytest_cache/
+
+# Node
+frontend/node_modules/
+frontend/dist/
+
+# Live capture sessions (Phase 2)
+backend/sessions/
+
+# OS
+.DS_Store
