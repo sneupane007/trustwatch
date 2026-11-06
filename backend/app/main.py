@@ -14,8 +14,11 @@ from scapy.error import Scapy_Exception
 
 from .detectors import ALL_DETECTORS
 from .engine.engine import analyze_file
+from .live import lifespan
+from .live import router as live_router
 
-app = FastAPI(title="TrustWatch API")
+app = FastAPI(title="TrustWatch API", lifespan=lifespan)
+app.include_router(live_router)
 
 
 @app.get("/api/health")
