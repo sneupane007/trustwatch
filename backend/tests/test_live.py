@@ -2,6 +2,7 @@
 
 import pytest
 from fastapi.testclient import TestClient
+from scapy.error import Scapy_Exception
 
 from app import live
 from app.engine.engine import analyze_file
@@ -74,3 +75,24 @@ def test_replay_only_reads_from_samples_folder(client):
     response = client.post("/api/live/start", json={"replay": "../app/main.py"})
 
     assert response.status_code == 404
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        PermissionError(1, "Operation not permitted"),  # Linux
+        Scapy_Exception("Permission denied: could not open /dev/bpf0. Make sure to be running Scapy as root ! (sudo)"),  # macOS
+    ],
+)
+def test_capture_permission_error_becomes_403_with_the_fix(client, monkeypatch, error):
+    def denied(iface):
+        raise error
+
+    monkeypatch.setattr(live.conf, "L2listen", denied)
+    interface = live.get_working_ifaces()[0].name
+
+    response = client.post("/api/live/start", json={"interface": interface})
+
+    assert response.status_code == 403
+    assert response.json()["detail"].startswith(f"Permission denied capturing on {interface}.")
+    assert not client.get("/api/live/status").json()["running"]

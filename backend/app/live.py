@@ -1,7 +1,7 @@
 """Live mode (Phase 2, Part 1): run the engine on packets as they arrive.
 
-One session at a time. A background thread feeds packets to Session.handle_packet():
-from a sample file for now (replay mode), from a network interface in Step 2.
+One session at a time. A background thread feeds packets to Session.handle_packet(),
+from a network interface or from a sample file (replay mode).
 Each WebSocket client gets a snapshot every second. The feeding thread and the
 WebSocket loops share the engine through one lock.
 
@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -25,7 +26,11 @@ from pathlib import Path
 from fastapi import APIRouter, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
+from scapy.config import conf
 from scapy.error import Scapy_Exception
+from scapy.interfaces import get_working_ifaces
+from scapy.sendrecv import AsyncSniffer
+from scapy.supersocket import SuperSocket
 from scapy.utils import PcapReader, PcapWriter
 
 from .engine.engine import Engine
@@ -103,6 +108,57 @@ def _replay(session: Session, reader: PcapReader, speed: float) -> None:
             session.handle_packet(pkt)
 
 
+def _sniff(session: Session, sock: SuperSocket) -> None:
+    """Capture from an already-open interface until Stop is pressed or the capture fails."""
+    started = threading.Event()
+    sniffer = AsyncSniffer(opened_socket=sock, prn=session.handle_packet, store=False, started_callback=started.set)
+    sniffer.start()
+    try:
+        while not started.wait(0.05) and sniffer.thread.is_alive():
+            pass  # stop() only works once the capture loop is set up, a moment after start()
+        while sniffer.thread.is_alive() and not session.stop_requested.wait(0.5):
+            pass
+        if sniffer.thread.is_alive():
+            sniffer.stop(join=False)  # wakes the capture loop
+        sniffer.join()  # waits for it, and re-raises the error if the capture failed
+    finally:
+        sock.close()
+
+
+def _open_interface(name: str) -> SuperSocket:
+    """Open the capture here, not in the sniffer thread, so a permission problem becomes a 403."""
+    if name not in {iface.name for iface in get_working_ifaces()}:
+        raise HTTPException(status_code=404, detail=f"No network interface named {name!r}.")
+    try:
+        return conf.L2listen(iface=name)
+    except (OSError, Scapy_Exception) as exc:
+        # Linux raises PermissionError; macOS raises Scapy_Exception("Permission denied: ...").
+        if isinstance(exc, PermissionError) or "Permission denied" in str(exc):
+            raise HTTPException(status_code=403, detail=_permission_help(name)) from exc
+        raise HTTPException(status_code=400, detail=f"Could not start capturing on {name} ({exc}).") from exc
+
+
+def _permission_help(name: str) -> str:
+    if sys.platform == "win32":
+        fix = "Install Npcap (it comes with Wireshark) and start the backend from an Administrator terminal."
+    else:
+        fix = "Restart the backend with sudo: sudo .venv/bin/uvicorn app.main:app --port 8000"
+        if sys.platform == "darwin":
+            fix += " (or install ChmodBPF from the Wireshark installer to capture without sudo)."
+    return f"Permission denied capturing on {name}. {fix}"
+
+
+def _open_sample(name: str) -> PcapReader:
+    path = _file_inside(SAMPLES_DIR, name, f"No sample capture named {name!r} in backend/samples/.")
+    try:
+        return PcapReader(str(path))
+    except (Scapy_Exception, EOFError) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not read {name} as a .pcap or .pcapng capture ({exc}).",
+        ) from exc
+
+
 def _new_session_folder() -> tuple[str, Path]:
     """Name a session by its start time, adding _2, _3... if two start in the same second."""
     base = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -135,9 +191,15 @@ async def lifespan(app: FastAPI):
         _current.stop()
 
 
+@router.get("/api/interfaces")
+def interfaces() -> list[dict]:
+    return [{"name": i.name, "description": i.description, "ip": i.ip} for i in get_working_ifaces()]
+
+
 class StartRequest(BaseModel):
-    replay: str  # a capture under backend/samples/, e.g. "mixed.pcapng" or "lab/arp_spoof.pcapng"
-    speed: float = Field(1.0, gt=0)
+    interface: str | None = None  # e.g. "en0", from GET /api/interfaces
+    replay: str | None = None  # a capture under backend/samples/, e.g. "mixed.pcapng" or "lab/arp_spoof.pcapng"
+    speed: float = Field(1.0, gt=0)  # replay only
 
 
 @router.post("/api/live/start")
@@ -149,15 +211,17 @@ def start(request: StartRequest) -> dict:
                 status_code=409,
                 detail=f"A live session is already running ({_current.source}). Stop it first.",
             )
-        path = _file_inside(SAMPLES_DIR, request.replay, f"No sample capture named {request.replay!r} in backend/samples/.")
-        try:
-            reader = PcapReader(str(path))
-        except (Scapy_Exception, EOFError) as exc:
+        if (request.interface is None) == (request.replay is None):
             raise HTTPException(
                 status_code=400,
-                detail=f"Could not read {request.replay} as a .pcap or .pcapng capture ({exc}).",
-            ) from exc
-        session = Session(f"{request.replay} (replay)", lambda s: _replay(s, reader, request.speed))
+                detail='Send either {"interface": "en0"} or {"replay": "mixed.pcapng"}.',
+            )
+        if request.interface is not None:
+            sock = _open_interface(request.interface)
+            session = Session(request.interface, lambda s: _sniff(s, sock))
+        else:
+            reader = _open_sample(request.replay)
+            session = Session(f"{request.replay} (replay)", lambda s: _replay(s, reader, request.speed))
         _current = session
     return {"session_id": session.id}
 
