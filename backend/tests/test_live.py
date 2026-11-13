@@ -2,9 +2,9 @@
 
 import pytest
 from fastapi.testclient import TestClient
-from scapy.error import Scapy_Exception
 
 from app import live
+from app.engine import tshark
 from app.engine.engine import analyze_file
 from app.main import app
 
@@ -78,21 +78,22 @@ def test_replay_only_reads_from_samples_folder(client):
 
 
 @pytest.mark.parametrize(
-    "error",
+    "message",
     [
-        PermissionError(1, "Operation not permitted"),  # Linux
-        Scapy_Exception("Permission denied: could not open /dev/bpf0. Make sure to be running Scapy as root ! (sudo)"),  # macOS
+        "You don't have permission to capture on that device (socket: Operation not permitted)",  # Linux
+        "You don't have permission to capture on that device ((cannot open BPF device) /dev/bpf0: Permission denied)",  # macOS
     ],
 )
-def test_capture_permission_error_becomes_403_with_the_fix(client, monkeypatch, error):
-    def denied(iface):
-        raise error
+def test_capture_permission_error_becomes_403_with_the_fix(client, monkeypatch, message):
+    def denied(interface, pcap):
+        raise tshark.TsharkError(message)
 
-    monkeypatch.setattr(live.conf, "L2listen", denied)
-    interface = live.get_working_ifaces()[0].name
+    monkeypatch.setattr(tshark, "interfaces", lambda: [{"name": "en0", "description": "Wi-Fi", "ip": ""}])
+    monkeypatch.setattr(tshark, "LiveCapture", denied)
 
-    response = client.post("/api/live/start", json={"interface": interface})
+    response = client.post("/api/live/start", json={"interface": "en0"})
 
     assert response.status_code == 403
-    assert response.json()["detail"].startswith(f"Permission denied capturing on {interface}.")
+    assert response.json()["detail"].startswith("Permission denied capturing on en0.")
     assert not client.get("/api/live/status").json()["running"]
+    assert list(live.SESSIONS_DIR.iterdir()) == []  # the failed start leaves no empty session behind
