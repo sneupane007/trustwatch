@@ -41,3 +41,25 @@ export interface AnalysisResult {
   alerts: Alert[];
   detectors: DetectorInfo[];
 }
+
+// Live mode (backend/app/live.py)
+
+export interface NetworkInterface {
+  name: string; // what to capture on, e.g. "en0"
+  description: string; // friendly name, e.g. "Wi-Fi"
+  ip: string; // first IPv4 address, or ""
+}
+
+export interface LiveStatus {
+  running: boolean;
+  session_id: string | null;
+  source: string | null;
+  started_at: number | null;
+}
+
+/** What the /api/live/ws WebSocket sends. A snapshot arrives every second. */
+export type LiveMessage =
+  | { type: "snapshot"; session_id: string; source: string; result: Omit<AnalysisResult, "filename"> }
+  | { type: "alert"; alert: Alert }
+  | { type: "error"; message: string }
+  | { type: "stopped"; session_id: string };
