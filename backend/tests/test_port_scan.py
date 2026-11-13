@@ -2,7 +2,7 @@ import random
 
 from app.detectors.port_scan import PortScanDetector
 from app.engine.engine import Engine, analyze_file
-from app.engine.packet import to_packet_info
+from app.engine.tshark import read_capture
 from scripts.make_samples import ATTACKER_IP, START, VICTIM_IP, baseline, port_scan, web_visit
 
 
@@ -47,14 +47,14 @@ def test_small_scan_below_threshold_is_not_flagged(capture_file):
     assert port_scan_alerts(analyze_file(path)) == []
 
 
-def test_live_style_feed_returns_the_alert_exactly_once():
+def test_live_style_feed_returns_the_alert_exactly_once(capture_file):
     # Phase 2 feeds packets one at a time; the alert must be "new" only once.
     engine = Engine(detectors=[PortScanDetector()])
-    pkts = sorted(port_scan(START, random.Random(5)), key=lambda p: float(p.time))
+    path = capture_file(port_scan(START, random.Random(5)))
 
     new_alerts = []
-    for number, pkt in enumerate(pkts, start=1):
-        new_alerts += engine.process(to_packet_info(pkt, number))
+    for pkt in read_capture(path):
+        new_alerts += engine.process(pkt)
 
     assert len(new_alerts) == 1
     assert new_alerts[0].details["ports_probed"] == 1000  # kept updating after it was raised
