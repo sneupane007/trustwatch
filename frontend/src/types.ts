@@ -41,3 +41,42 @@ export interface AnalysisResult {
   alerts: Alert[];
   detectors: DetectorInfo[];
 }
+
+// Live mode (backend/app/live.py, API contract in docs/phase2-part1-live-backend.md).
+
+export interface NetworkInterface {
+  name: string;
+  description: string;
+  ip: string | null;
+}
+
+export interface LiveStatus {
+  running: boolean;
+  session_id: string | null;
+  source: string | null;
+  started_at: number | null;
+}
+
+/** Live snapshots and saved sessions are Engine.result() without a filename. */
+export type LiveResult = Omit<AnalysisResult, "filename">;
+
+export type LiveMessage =
+  | { type: "snapshot"; session_id: string; source: string; result: LiveResult }
+  | { type: "alert"; alert: Alert }
+  | { type: "stopped"; session_id: string }
+  | { type: "error"; message: string };
+
+export interface SessionSummary {
+  id: string;
+  source: string;
+  started_at: number;
+  ended_at: number;
+  packets: number;
+  alerts: number;
+}
+
+export interface SavedSession extends LiveResult {
+  source: string;
+  started_at: number;
+  ended_at: number;
+}

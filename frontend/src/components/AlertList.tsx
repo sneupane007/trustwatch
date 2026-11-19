@@ -6,9 +6,11 @@ interface Props {
   alerts: Alert[];
   detectors: DetectorInfo[];
   captureStart: number | null;
+  onSelect: (alert: Alert) => void;
+  highlightId?: string | null; // briefly flashed, e.g. an alert that just arrived live
 }
 
-export function AlertList({ alerts, detectors, captureStart }: Props) {
+export function AlertList({ alerts, detectors, captureStart, onSelect, highlightId }: Props) {
   const pending = detectors.filter((d) => !d.implemented).map((d) => d.name);
 
   if (alerts.length === 0) {
@@ -25,13 +27,26 @@ export function AlertList({ alerts, detectors, captureStart }: Props) {
   return (
     <ul className="alerts">
       {alerts.map((alert) => (
-        <li key={alert.id} className="alert">
+        <li
+          key={alert.id}
+          className={`alert alert-clickable${alert.id === highlightId ? " alert-flash" : ""}`}
+          onClick={(e) => {
+            if (!window.getSelection()?.toString() && !(e.target as HTMLElement).closest("button")) onSelect(alert);
+          }}
+        >
           <div className="alert-head">
             <SeverityBadge severity={alert.severity} />
-            <h3>{alert.title}</h3>
+            <h3>
+              <button type="button" className="link-button" onClick={() => onSelect(alert)}>
+                {alert.title}
+              </button>
+            </h3>
             <span className="muted">
               {formatClock(alert.first_time)}
               {captureStart !== null && ` · ${(alert.first_time - captureStart).toFixed(1)} s into the capture`}
+            </span>
+            <span className="details-hint muted small" aria-hidden="true">
+              Details →
             </span>
           </div>
           {(alert.attacker || alert.victim) && (
