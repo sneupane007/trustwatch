@@ -1,212 +1,312 @@
-import { useEffect, useState } from "react";
-import { fetchInterfaces, fetchLiveStatus, openLiveSocket, startLive, stopLive } from "../api";
-import { formatCount, formatDuration } from "../format";
-import type { Alert, AnalysisResult, LiveMessage, NetworkInterface } from "../types";
+import { useEffect, useRef, useState } from "react";
+import { fetchInterfaces, fetchLiveStatus, liveSocketUrl, startLive, stopLive, type LiveSource } from "../api";
+import { formatCount } from "../format";
+import type { Alert, LiveMessage, LiveResult, LiveStatus, NetworkInterface } from "../types";
 import { Dashboard } from "./Dashboard";
-import { SEVERITY_COLOR, SeverityBadge } from "./SeverityBadge";
+import { SeverityBadge } from "./SeverityBadge";
 
-const REPLAY_SAMPLE = "mixed.pcapng";
-const REPLAY = `replay:${REPLAY_SAMPLE}`; // the select value for replay; no interface is named like this
-const TOAST_MS = 8000;
+// Captures under backend/samples/ that can be replayed as if they were live.
+const REPLAY_SAMPLES = [
+  { file: "mixed.pcapng", label: "mixed.pcapng: all three attacks (synthetic)" },
+  { file: "lab/arp_spoof.pcapng", label: "lab/arp_spoof.pcapng: ARP spoofing from our lab" },
+  { file: "baseline.pcap", label: "baseline.pcap: normal traffic only" },
+];
+const SPEEDS = [1, 5, 20];
+const TOAST_SECONDS = 6;
+const HIGHLIGHT_SECONDS = 3;
+const RETRY_SECONDS = 2;
 
-interface Session {
-  id: string;
-  running: boolean;
-  startedAt: number | null; // seconds since the epoch, for the elapsed time
+type Snapshot = { session_id: string; source: string; result: LiveResult };
+type Notice = { kind: "saved"; sessionId: string } | { kind: "error"; message: string };
+type Toast = { key: number; alert: Alert };
+type Connection = "connecting" | "open" | "retrying";
+
+const IDLE: LiveStatus = { running: false, session_id: null, source: null, started_at: null };
+
+function formatElapsed(seconds: number): string {
+  const s = Math.max(0, Math.floor(seconds));
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return s >= 3600
+    ? `${Math.floor(s / 3600)}:${pad(Math.floor((s % 3600) / 60))}:${pad(s % 60)}`
+    : `${pad(Math.floor(s / 60))}:${pad(s % 60)}`;
 }
 
-interface Toast {
-  key: string;
-  alert: Alert;
+/** "mixed.pcapng (replay)" -> "Replaying mixed.pcapng"; "en0" -> "Recording on en0". */
+function describeSource(source: string): string {
+  return source.endsWith(" (replay)") ? `Replaying ${source.slice(0, -" (replay)".length)}` : `Recording on ${source}`;
 }
 
-function interfaceLabel(iface: NetworkInterface): string {
-  const name = iface.description.includes(iface.name) ? iface.description : `${iface.description} (${iface.name})`;
-  return iface.ip ? `${name} · ${iface.ip}` : name;
+interface Props {
+  onOpenSession: (id: string) => void;
 }
 
-function errorText(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
-}
+export function LiveView({ onOpenSession }: Props) {
+  const [interfaces, setInterfaces] = useState<NetworkInterface[] | null>(null);
+  const [interfaceError, setInterfaceError] = useState<string | null>(null);
+  const [choice, setChoice] = useState(`replay:${REPLAY_SAMPLES[0].file}`);
+  const [speed, setSpeed] = useState(1);
 
-/** Pick a source, press Start, and watch the dashboard update every second. */
-export function LiveView() {
-  const [interfaces, setInterfaces] = useState<NetworkInterface[]>([]);
-  const [choice, setChoice] = useState(REPLAY);
-  const [session, setSession] = useState<Session | null>(null);
-  const [result, setResult] = useState<AnalysisResult | null>(null);
-  const [toasts, setToasts] = useState<Toast[]>([]);
-  const [error, setError] = useState<string | null>(null);
+  const [status, setStatus] = useState<LiveStatus>(IDLE);
   const [busy, setBusy] = useState(false);
-  const [disconnected, setDisconnected] = useState(false);
+  const [connection, setConnection] = useState<Connection>("connecting");
+  const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
+  const [rate, setRate] = useState<number | null>(null);
+  const [notice, setNotice] = useState<Notice | null>(null);
+  const [toasts, setToasts] = useState<Toast[]>([]);
+  const [highlightId, setHighlightId] = useState<string | null>(null);
+  const [now, setNow] = useState(() => Date.now() / 1000);
+
+  const lastCount = useRef<{ session: string; packets: number; at: number } | null>(null);
+  const toastKey = useRef(0);
 
   useEffect(() => {
     fetchInterfaces()
-      .then((list) => {
-        setInterfaces([...list].sort((a, b) => Number(!a.ip) - Number(!b.ip))); // ones with an address first
-        const likely = list.find((i) => i.ip && !i.ip.startsWith("127.")); // e.g. Wi-Fi, or a VM's network adapter
-        if (likely) setChoice(likely.name);
-      })
-      .catch((err) => setError(errorText(err)));
+      .then(setInterfaces)
+      .catch((err) => setInterfaceError(err instanceof Error ? err.message : String(err)));
+  }, []);
 
-    // A session may already be running (started earlier, or with curl): get its start time.
+  function refreshStatus() {
     fetchLiveStatus()
-      .then((status) => {
-        const { session_id: id, started_at: startedAt } = status;
-        if (status.running && id !== null) {
-          setSession((s) => (s?.id === id ? { ...s, startedAt } : { id, running: true, startedAt }));
-        }
-      })
-      .catch(() => {}); // the interface list already shows any backend error
-  }, []);
+      .then(setStatus)
+      .catch(() => {}); // the socket's own retry loop reports a down backend
+  }
 
+  // One WebSocket for as long as the tab exists; reconnect every 2 s if it drops.
   useEffect(() => {
-    const socket = openLiveSocket();
-    let closedByUs = false; // leaving the Live tab, or React running effects twice in dev
-    let sessionId = ""; // alert ids restart in every session, so toast keys include the session
+    let socket: WebSocket | null = null;
+    let retry: ReturnType<typeof setTimeout> | undefined;
+    let unmounted = false;
 
-    socket.onmessage = (event) => {
-      const message: LiveMessage = JSON.parse(event.data);
-      if (message.type === "snapshot") {
-        sessionId = message.session_id;
-        setSession((s) => (s?.id === message.session_id ? s : { id: message.session_id, running: true, startedAt: null }));
-        setResult({ ...message.result, filename: message.source });
-      } else if (message.type === "alert") {
-        const key = `${sessionId}/${message.alert.id}`;
-        setToasts((t) => [...t, { key, alert: message.alert }]);
-        setTimeout(() => setToasts((t) => t.filter((toast) => toast.key !== key)), TOAST_MS);
-      } else if (message.type === "error") {
-        setError(message.message);
-      } else {
-        setSession((s) => (s?.id === message.session_id ? { ...s, running: false } : s));
+    function handle(message: LiveMessage) {
+      switch (message.type) {
+        case "snapshot": {
+          const packets = message.result.summary.packets;
+          const at = Date.now() / 1000;
+          const last = lastCount.current;
+          if (last && last.session === message.session_id && at > last.at) {
+            setRate((packets - last.packets) / (at - last.at));
+          }
+          lastCount.current = { session: message.session_id, packets, at };
+          setSnapshot({ session_id: message.session_id, source: message.source, result: message.result });
+          break;
+        }
+        case "alert": {
+          const key = ++toastKey.current;
+          setToasts((t) => [...t, { key, alert: message.alert }]);
+          setHighlightId(message.alert.id);
+          setTimeout(() => setToasts((t) => t.filter((x) => x.key !== key)), TOAST_SECONDS * 1000);
+          setTimeout(() => setHighlightId((id) => (id === message.alert.id ? null : id)), HIGHLIGHT_SECONDS * 1000);
+          break;
+        }
+        case "stopped":
+          setStatus(IDLE);
+          setRate(null);
+          setNotice((n) => (n?.kind === "error" ? n : { kind: "saved", sessionId: message.session_id }));
+          break;
+        case "error":
+          setNotice({ kind: "error", message: message.message });
+          break;
       }
-    };
-    socket.onclose = () => {
-      if (!closedByUs) setDisconnected(true);
-    };
+    }
+
+    function connect() {
+      setConnection("connecting");
+      socket = new WebSocket(liveSocketUrl());
+      socket.onopen = () => {
+        setConnection("open");
+        refreshStatus();
+      };
+      socket.onmessage = (event) => handle(JSON.parse(event.data) as LiveMessage);
+      socket.onclose = () => {
+        if (unmounted) return;
+        setConnection("retrying");
+        retry = setTimeout(connect, RETRY_SECONDS * 1000);
+      };
+    }
+
+    connect();
     return () => {
-      closedByUs = true;
-      socket.close();
+      unmounted = true;
+      clearTimeout(retry);
+      socket?.close();
     };
   }, []);
 
-  async function act(action: () => Promise<void>) {
+  // Tick the elapsed time while recording.
+  useEffect(() => {
+    if (!status.running) return;
+    const timer = setInterval(() => setNow(Date.now() / 1000), 1000);
+    return () => clearInterval(timer);
+  }, [status.running]);
+
+  async function start() {
+    const [kind, value] = [choice.slice(0, choice.indexOf(":")), choice.slice(choice.indexOf(":") + 1)];
+    const source: LiveSource = kind === "replay" ? { replay: value, speed } : { interface: value };
     setBusy(true);
-    setError(null);
+    setNotice(null);
+    setToasts([]);
+    setSnapshot(null);
+    setRate(null);
+    lastCount.current = null;
     try {
-      await action();
+      await startLive(source);
+      setNow(Date.now() / 1000);
+      refreshStatus();
     } catch (err) {
-      setError(errorText(err));
+      setNotice({ kind: "error", message: err instanceof Error ? err.message : String(err) });
     } finally {
       setBusy(false);
     }
   }
 
-  async function start() {
-    const { session_id } = await startLive(choice === REPLAY ? { replay: REPLAY_SAMPLE } : { interface: choice });
-    setSession({ id: session_id, running: true, startedAt: Date.now() / 1000 });
+  async function stop() {
+    setBusy(true);
+    try {
+      const stopped = await stopLive();
+      setStatus(IDLE);
+      setRate(null);
+      setNotice((n) => (n?.kind === "error" ? n : { kind: "saved", sessionId: stopped.session_id }));
+    } catch (err) {
+      setNotice({ kind: "error", message: err instanceof Error ? err.message : String(err) });
+    } finally {
+      setBusy(false);
+    }
   }
 
-  const running = session?.running ?? false;
-  const elapsed = running && session?.startedAt != null ? Math.max(0, Date.now() / 1000 - session.startedAt) : null;
+  const isReplay = choice.startsWith("replay:");
 
   return (
-    <div className="start">
-      <section className="panel">
-        <header>
-          <h2>Live capture</h2>
-          <p className="muted">
-            The same detectors as upload mode, running on packets as they arrive. An alert pops up as soon as an attack
-            is spotted.
-          </p>
-        </header>
-
-        <div className="live-controls">
-          <select
-            className="select"
-            aria-label="What to capture"
-            value={choice}
-            onChange={(e) => setChoice(e.target.value)}
-            disabled={running}
-          >
-            {interfaces.length > 0 && (
-              <optgroup label="Network interfaces">
-                {interfaces.map((iface) => (
-                  <option key={iface.name} value={iface.name}>
-                    {interfaceLabel(iface)}
+    <div className="live">
+      <section className="panel live-controls" aria-label="Live capture controls">
+        <div className="control-row">
+          <label className="field">
+            <span className="field-label">Source</span>
+            <select value={choice} onChange={(e) => setChoice(e.target.value)} disabled={status.running || busy}>
+              <optgroup label="Replay a sample (no lab needed)">
+                {REPLAY_SAMPLES.map((s) => (
+                  <option key={s.file} value={`replay:${s.file}`}>
+                    {s.label}
                   </option>
                 ))}
               </optgroup>
+              <optgroup label={interfaces === null && !interfaceError ? "Network interfaces (loading…)" : "Network interfaces"}>
+                {(interfaces ?? []).map((i) => (
+                  <option key={i.name} value={`iface:${i.name}`}>
+                    {i.name}
+                    {i.description && i.description !== i.name ? ` (${i.description})` : ""}
+                    {i.ip ? ` · ${i.ip}` : ""}
+                  </option>
+                ))}
+              </optgroup>
+            </select>
+          </label>
+          {isReplay && (
+            <label className="field field-narrow">
+              <span className="field-label">Speed</span>
+              <select value={speed} onChange={(e) => setSpeed(Number(e.target.value))} disabled={status.running || busy}>
+                {SPEEDS.map((s) => (
+                  <option key={s} value={s}>
+                    {s}×
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
+          <div className="control-buttons">
+            {status.running ? (
+              <button type="button" className="btn btn-stop" onClick={stop} disabled={busy}>
+                <span className="square" aria-hidden="true" /> Stop
+              </button>
+            ) : (
+              <button type="button" className="btn btn-primary" onClick={start} disabled={busy}>
+                <span className="dot dot-start" aria-hidden="true" /> Start
+              </button>
             )}
-            <optgroup label="Demo without the lab">
-              <option value={REPLAY}>Replay {REPLAY_SAMPLE} (all three attacks, about 90 s)</option>
-            </optgroup>
-          </select>
-          <button className="btn btn-primary" onClick={() => act(start)} disabled={busy || running}>
-            Start
-          </button>
-          <button className="btn" onClick={() => act(stopLive)} disabled={busy || !running}>
-            Stop
-          </button>
+          </div>
         </div>
 
-        <p className="live-status">
-          {running ? (
+        <p className="live-status" role="status">
+          {status.running && status.source ? (
             <>
-              <span className="dot dot-live" aria-hidden="true" />
-              <strong>Recording</strong>
-              {result && <span className="mono">{result.filename}</span>}
-              {elapsed !== null && (
-                <span className="muted">· {elapsed < 60 ? `${Math.floor(elapsed)} s` : formatDuration(Math.floor(elapsed))}</span>
-              )}
-              {result && <span className="muted">· {formatCount(result.summary.packets)} packets</span>}
+              <span className="dot dot-live" aria-hidden="true" /> {describeSource(status.source)}
+              {status.started_at !== null && ` · ${formatElapsed(now - status.started_at)} elapsed`}
+              {rate !== null && ` · ${formatCount(Math.max(0, Math.round(rate)))} packets/s`}
             </>
-          ) : session ? (
-            <span>
-              Stopped. Saved to <code>backend/sessions/{session.id}/</code> (open <code>capture.pcap</code> in Wireshark).
-            </span>
           ) : (
-            <span className="muted">Not recording. Pick what to capture and press Start.</span>
+            <span className="muted">Not recording.</span>
           )}
+          {connection === "retrying" && <span className="warn"> · Disconnected, retrying…</span>}
+          {connection === "connecting" && <span className="muted"> · Connecting…</span>}
         </p>
-        <p className="muted small">
-          For real attacks, run TrustWatch on the victim VM and pick its host-only adapter. Only attack your own lab VMs.
-        </p>
+        {interfaceError && (
+          <p className="muted small">Couldn't list network interfaces ({interfaceError}). Replay still works.</p>
+        )}
       </section>
 
-      {disconnected && (
+      {notice?.kind === "error" && (
         <div className="notice notice-error" role="alert">
-          Lost the connection to the backend. Check that it is still running, then reload this page.
+          <strong>Live capture problem</strong>
+          <p>{notice.message}</p>
         </div>
       )}
-      {error && (
-        <div className="notice notice-error" role="alert">
-          {error}
+      {notice?.kind === "saved" && (
+        <div className="notice notice-ok">
+          <p>
+            <span className="good">✓</span> Session saved.{" "}
+            <button type="button" className="link-button" onClick={() => onOpenSession(notice.sessionId)}>
+              Open it in History
+            </button>
+          </p>
         </div>
       )}
-
-      {result && <Dashboard result={result} />}
 
       <div className="toasts" aria-live="polite">
         {toasts.map(({ key, alert }) => (
-          <div key={key} className="toast" style={{ borderLeftColor: SEVERITY_COLOR[alert.severity] }}>
+          <div key={key} className={`toast toast-${alert.severity}`}>
             <SeverityBadge severity={alert.severity} />
-            <div className="toast-body">
+            <span>
               <strong>{alert.title}</strong>
-              <span className="mono small">
-                {alert.attacker ?? "unknown"} → {alert.victim ?? "unknown"}
-              </span>
-            </div>
+              {(alert.attacker || alert.victim) && (
+                <span className="mono">
+                  {" "}
+                  · {alert.attacker ?? "unknown"} → {alert.victim ?? "unknown"}
+                </span>
+              )}
+            </span>
             <button
-              className="toast-close"
-              aria-label="Dismiss"
-              onClick={() => setToasts((t) => t.filter((toast) => toast.key !== key))}
+              type="button"
+              className="btn-close btn"
+              onClick={() => setToasts((t) => t.filter((x) => x.key !== key))}
             >
-              ×
+              <span aria-hidden="true">✕</span>
+              <span className="visually-hidden">Dismiss</span>
             </button>
           </div>
         ))}
       </div>
+
+      {snapshot ? (
+        <Dashboard
+          result={{ ...snapshot.result, filename: snapshot.source }}
+          live={status.running && status.session_id === snapshot.session_id}
+          highlightAlertId={highlightId}
+        />
+      ) : status.running ? (
+        <div className="panel empty-state">
+          <div className="spinner" aria-hidden="true" />
+          <p>Waiting for the first snapshot…</p>
+        </div>
+      ) : (
+        <div className="panel empty-state">
+          <p>
+            <strong>Watch traffic as it happens.</strong>
+          </p>
+          <p className="muted">
+            Pick a network interface to capture live, or replay a sample to demo without the lab. Alerts pop up here
+            the moment a detector raises them, and every session is saved to History.
+          </p>
+        </div>
+      )}
     </div>
   );
 }

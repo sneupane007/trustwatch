@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { analyzeCapture, fetchDetectors } from "./api";
 import { Dashboard } from "./components/Dashboard";
 import { LiveView } from "./components/LiveView";
+import { SessionHistory } from "./components/SessionHistory";
 import { UploadZone } from "./components/UploadZone";
 import type { AnalysisResult, DetectorInfo } from "./types";
 
@@ -10,6 +11,13 @@ type State =
   | { kind: "loading"; fileName: string }
   | { kind: "error"; message: string }
   | { kind: "done"; result: AnalysisResult };
+
+type Tab = "upload" | "live" | "history";
+const TABS: { id: Tab; label: string }[] = [
+  { id: "upload", label: "Upload" },
+  { id: "live", label: "Live" },
+  { id: "history", label: "History" },
+];
 
 function Logo() {
   return (
@@ -28,10 +36,11 @@ function Logo() {
 }
 
 export default function App() {
-  const [mode, setMode] = useState<"upload" | "live">("upload");
   const [state, setState] = useState<State>({ kind: "idle" });
   const [detectors, setDetectors] = useState<DetectorInfo[] | null>(null);
   const [backendDown, setBackendDown] = useState(false);
+  const [tab, setTab] = useState<Tab>("upload");
+  const [openSession, setOpenSession] = useState<string | null>(null);
 
   useEffect(() => {
     fetchDetectors()
@@ -40,7 +49,7 @@ export default function App() {
   }, []);
 
   async function handleFile(file: File) {
-    setMode("upload");
+    setTab("upload");
     setState({ kind: "loading", fileName: file.name });
     try {
       setState({ kind: "done", result: await analyzeCapture(file) });
@@ -60,13 +69,23 @@ export default function App() {
           </div>
         </div>
         <div className="actions">
-          <button
-            className="btn"
-            aria-pressed={mode === "live"}
-            onClick={() => setMode(mode === "live" ? "upload" : "live")}
-          >
-            <span className="dot" aria-hidden="true" /> Live capture
-          </button>
+          <nav className="tabs" role="tablist" aria-label="Mode">
+            {TABS.map((t) => (
+              <button
+                key={t.id}
+                type="button"
+                role="tab"
+                id={`tab-${t.id}`}
+                aria-selected={tab === t.id}
+                aria-controls={`panel-${t.id}`}
+                className="tab"
+                onClick={() => setTab(t.id)}
+              >
+                {t.id === "live" && <span className="dot" aria-hidden="true" />}
+                {t.label}
+              </button>
+            ))}
+          </nav>
           <label className="btn btn-primary">
             Upload capture
             <input
@@ -84,19 +103,31 @@ export default function App() {
       </header>
 
       <main>
-        {mode === "live" ? (
-          <LiveView />
-        ) : state.kind === "done" ? (
-          <Dashboard result={state.result} />
-        ) : (
-          <UploadZone
-            onFile={handleFile}
-            loadingFile={state.kind === "loading" ? state.fileName : null}
-            error={state.kind === "error" ? state.message : null}
-            detectors={detectors}
-            backendDown={backendDown}
+        <div role="tabpanel" id="panel-upload" aria-labelledby="tab-upload" hidden={tab !== "upload"}>
+          {state.kind === "done" ? (
+            <Dashboard result={state.result} />
+          ) : (
+            <UploadZone
+              onFile={handleFile}
+              loadingFile={state.kind === "loading" ? state.fileName : null}
+              error={state.kind === "error" ? state.message : null}
+              detectors={detectors}
+              backendDown={backendDown}
+            />
+          )}
+        </div>
+        {/* Live stays mounted on other tabs so its connection and running session aren't lost. */}
+        <div role="tabpanel" id="panel-live" aria-labelledby="tab-live" hidden={tab !== "live"}>
+          <LiveView
+            onOpenSession={(id) => {
+              setOpenSession(id);
+              setTab("history");
+            }}
           />
-        )}
+        </div>
+        <div role="tabpanel" id="panel-history" aria-labelledby="tab-history" hidden={tab !== "history"}>
+          <SessionHistory active={tab === "history"} openId={openSession} onOpen={setOpenSession} />
+        </div>
       </main>
     </div>
   );

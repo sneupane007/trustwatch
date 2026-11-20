@@ -1,6 +1,7 @@
-import type { ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import { formatBytes, formatClock, formatCount, formatDate, formatDuration } from "../format";
 import type { AnalysisResult, Severity } from "../types";
+import { AlertDetail } from "./AlertDetail";
 import { AlertList } from "./AlertList";
 import { DetectorList } from "./DetectorList";
 import { ProtocolBars } from "./ProtocolBars";
@@ -38,14 +39,28 @@ function severityNote(result: AnalysisResult): string {
   return parts.length ? parts.join(" · ") : "none found";
 }
 
-/** Everything we know about one capture. Phase 2's live view can reuse it with live data. */
-export function Dashboard({ result }: { result: AnalysisResult }) {
+interface Props {
+  result: AnalysisResult;
+  live?: boolean; // shows a Live badge; the live view passes a fresh snapshot every second
+  highlightAlertId?: string | null;
+}
+
+/** Everything we know about one capture: an upload, a live snapshot or a saved session. */
+export function Dashboard({ result, live = false, highlightAlertId = null }: Props) {
   const { summary } = result;
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  // Look the alert up by id so an open panel keeps updating while a live attack goes on.
+  const selected = result.alerts.find((a) => a.id === selectedId) ?? null;
 
   return (
     <div className="dashboard">
       <div className="file-bar">
         <span className="mono file-name">{result.filename}</span>
+        {live && (
+          <span className="live-badge">
+            <span className="dot dot-live" aria-hidden="true" /> Live
+          </span>
+        )}
         {summary.start !== null && summary.end !== null && (
           <span className="muted">
             {formatDate(summary.start)} · {formatClock(summary.start)} – {formatClock(summary.end)}
@@ -75,7 +90,13 @@ export function Dashboard({ result }: { result: AnalysisResult }) {
       </div>
 
       <Panel title={`Alerts (${result.alerts.length})`}>
-        <AlertList alerts={result.alerts} detectors={result.detectors} captureStart={summary.start} />
+        <AlertList
+          alerts={result.alerts}
+          detectors={result.detectors}
+          captureStart={summary.start}
+          onSelect={(alert) => setSelectedId(alert.id)}
+          highlightId={highlightAlertId}
+        />
       </Panel>
 
       <div className="grid grid-halves">
@@ -86,6 +107,8 @@ export function Dashboard({ result }: { result: AnalysisResult }) {
           <TopTalkers talkers={result.top_talkers} alerts={result.alerts} />
         </Panel>
       </div>
+
+      {selected && <AlertDetail key={selected.id} alert={selected} onClose={() => setSelectedId(null)} />}
     </div>
   );
 }

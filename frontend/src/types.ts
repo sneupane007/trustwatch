@@ -42,12 +42,12 @@ export interface AnalysisResult {
   detectors: DetectorInfo[];
 }
 
-// Live mode (backend/app/live.py)
+// Live mode (backend/app/live.py, API contract in docs/phase2-part1-live-backend.md).
 
 export interface NetworkInterface {
-  name: string; // what to capture on, e.g. "en0"
-  description: string; // friendly name, e.g. "Wi-Fi"
-  ip: string; // first IPv4 address, or ""
+  name: string;
+  description: string;
+  ip: string | null;
 }
 
 export interface LiveStatus {
@@ -57,9 +57,26 @@ export interface LiveStatus {
   started_at: number | null;
 }
 
-/** What the /api/live/ws WebSocket sends. A snapshot arrives every second. */
+/** Live snapshots and saved sessions are Engine.result() without a filename. */
+export type LiveResult = Omit<AnalysisResult, "filename">;
+
 export type LiveMessage =
-  | { type: "snapshot"; session_id: string; source: string; result: Omit<AnalysisResult, "filename"> }
+  | { type: "snapshot"; session_id: string; source: string; result: LiveResult }
   | { type: "alert"; alert: Alert }
-  | { type: "error"; message: string }
-  | { type: "stopped"; session_id: string };
+  | { type: "stopped"; session_id: string }
+  | { type: "error"; message: string };
+
+export interface SessionSummary {
+  id: string;
+  source: string;
+  started_at: number;
+  ended_at: number;
+  packets: number;
+  alerts: number;
+}
+
+export interface SavedSession extends LiveResult {
+  source: string;
+  started_at: number;
+  ended_at: number;
+}
