@@ -25,7 +25,7 @@ Phase 2 adds live capture: the same detectors running on traffic as it happens.
 
 ## Run it
 
-Needs **Python 3.10+** and **Node.js 20.19+** (built with Python 3.14 and Node 25).
+Needs **Python 3.10+**, **Node.js 20.19+** and **Wireshark** (built with Python 3.14, Node 25 and Wireshark 4.6). TrustWatch decodes every packet with tshark, Wireshark's command-line version, so the app and the tests need it. On the Ubuntu lab VMs: `sudo apt install tshark`.
 
 **Terminal 1: backend** (API on port 8000)
 ```bash
@@ -73,7 +73,7 @@ Real captures from the VirtualBox lab go in `backend/samples/lab/` (Phase 1 Part
 ## How it works
 
 ```
- .pcap / .pcapng ──► Scapy reads each packet ──► PacketInfo (plain fields)
+ .pcap / .pcapng ──► tshark decodes each packet ──► PacketInfo (plain fields)
                                                       │
                                 Engine.process(pkt) ──┼──► ARP spoofing detector
                                                       ├──► DNS spoofing detector
@@ -93,8 +93,10 @@ Real captures from the VirtualBox lab go in `backend/samples/lab/` (Phase 1 Part
 backend/
   app/
     main.py                 HTTP API: /api/health, /api/detectors, /api/analyze
+    live.py                 Live capture, replay, WebSocket, saved sessions
     engine/
-      packet.py             Scapy packet → PacketInfo
+      tshark.py             Runs Wireshark's tshark, dumpcap and editcap
+      packet.py             tshark output → PacketInfo
       detector.py           Detector base class + Alert
       engine.py             Runs detectors + stats; analyze_file()
       stats.py              Totals, protocols, top talkers, timeline

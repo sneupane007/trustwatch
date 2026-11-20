@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { analyzeCapture, fetchDetectors } from "./api";
 import { Dashboard } from "./components/Dashboard";
+import { LiveView } from "./components/LiveView";
 import { UploadZone } from "./components/UploadZone";
 import type { AnalysisResult, DetectorInfo } from "./types";
 
@@ -27,6 +28,7 @@ function Logo() {
 }
 
 export default function App() {
+  const [mode, setMode] = useState<"upload" | "live">("upload");
   const [state, setState] = useState<State>({ kind: "idle" });
   const [detectors, setDetectors] = useState<DetectorInfo[] | null>(null);
   const [backendDown, setBackendDown] = useState(false);
@@ -38,6 +40,7 @@ export default function App() {
   }, []);
 
   async function handleFile(file: File) {
+    setMode("upload");
     setState({ kind: "loading", fileName: file.name });
     try {
       setState({ kind: "done", result: await analyzeCapture(file) });
@@ -57,8 +60,12 @@ export default function App() {
           </div>
         </div>
         <div className="actions">
-          <button className="btn" disabled title="Live capture arrives in Phase 2">
-            <span className="dot" aria-hidden="true" /> Live capture <span className="tag">Phase 2</span>
+          <button
+            className="btn"
+            aria-pressed={mode === "live"}
+            onClick={() => setMode(mode === "live" ? "upload" : "live")}
+          >
+            <span className="dot" aria-hidden="true" /> Live capture
           </button>
           <label className="btn btn-primary">
             Upload capture
@@ -77,7 +84,9 @@ export default function App() {
       </header>
 
       <main>
-        {state.kind === "done" ? (
+        {mode === "live" ? (
+          <LiveView />
+        ) : state.kind === "done" ? (
           <Dashboard result={state.result} />
         ) : (
           <UploadZone

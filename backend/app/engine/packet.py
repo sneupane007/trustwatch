@@ -1,18 +1,13 @@
-"""Turn a Scapy packet into a small, plain record that detectors read.
+"""Turn tshark's view of a packet into a small, plain record that detectors read.
 
-Detectors never touch Scapy directly. That keeps them easy to test, and it lets
+tshark (Wireshark's command-line version, see tshark.py) decodes every packet.
+Detectors only ever see PacketInfo. That keeps them easy to test, and it lets
 file mode (Phase 1) and live capture (Phase 2) share exactly the same code.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-
-from scapy.layers.dns import DNS
-from scapy.layers.inet import ICMP, IP, TCP, UDP
-from scapy.layers.inet6 import IPv6
-from scapy.layers.l2 import ARP, Ether
-from scapy.packet import Packet
 
 
 @dataclass
@@ -44,60 +39,100 @@ class PacketInfo:
     dst_ip: str | None = None
     src_port: int | None = None
     dst_port: int | None = None
-    tcp_flags: str | None = None  # Scapy flag letters: "S" = SYN, "SA" = SYN/ACK, "RA" = RST/ACK
+    tcp_flags: str | None = None  # flag letters: "S" = SYN, "SA" = SYN/ACK, "RA" = RST/ACK
     arp: ArpInfo | None = None
     dns: DnsInfo | None = None
 
 
-def _text(value: bytes | str) -> str:
-    return value.decode(errors="replace") if isinstance(value, bytes) else str(value)
+# What we ask tshark for, in this order. parse_fields() reads one output line of them.
+TSHARK_FIELDS = [
+    "frame.number", "frame.time_epoch", "frame.len", "frame.protocols",
+    "eth.src", "eth.dst", "ip.src", "ip.dst", "ipv6.src", "ipv6.dst",
+    "tcp.srcport", "tcp.dstport", "tcp.flags", "udp.srcport", "udp.dstport",
+    "arp.opcode", "arp.src.proto_ipv4", "arp.src.hw_mac", "arp.dst.proto_ipv4", "arp.dst.hw_mac",
+    "dns.id", "dns.flags.response", "dns.qry.name", "dns.count.answers", "dns.resp.type", "dns.a", "dns.aaaa",
+]
+
+TCP_FLAG_LETTERS = "FSRPAUECN"  # bit 0 = FIN, bit 1 = SYN, ... so 0x012 is "SA"
 
 
-def _dns_info(dns: DNS) -> DnsInfo:
-    qname = _text(dns.qd[0].qname).rstrip(".") if dns.qd else ""
-    answers = [_text(rr.rdata) for rr in (dns.an or []) if getattr(rr, "type", None) in (1, 28)]
-    return DnsInfo(id=int(dns.id), is_response=bool(dns.qr), qname=qname, answers=answers)
+def parse_fields(line: str) -> PacketInfo:
+    """One line of tshark field output -> PacketInfo. Fields with several values are comma-separated."""
+    row = dict(zip(TSHARK_FIELDS, line.rstrip("\r\n").split("\t")))
 
+    def all_of(name: str) -> list[str]:
+        value = row.get(name, "")
+        return value.split(",") if value else []
 
-def to_packet_info(pkt: Packet, number: int) -> PacketInfo:
-    info = PacketInfo(number=number, time=float(pkt.time), length=len(pkt), protocol="Other")
+    def first(name: str) -> str | None:
+        # The outer header. ICMP errors quote the packet that caused them, so tshark also
+        # reports that inner packet's addresses and ports after the real ones.
+        values = all_of(name)
+        return values[0] if values else None
 
-    if Ether in pkt:
-        info.src_mac, info.dst_mac = pkt[Ether].src, pkt[Ether].dst
+    layers = row["frame.protocols"].split(":")
+    for i, layer in enumerate(layers):
+        if layer in ("icmp", "icmpv6"):
+            layers = layers[: i + 1]  # anything after this is the quoted packet
+            break
 
-    if ARP in pkt:
-        arp = pkt[ARP]
+    info = PacketInfo(
+        number=int(row["frame.number"]),
+        time=float(row["frame.time_epoch"]),
+        length=int(row["frame.len"]),
+        protocol="Other",
+        src_mac=first("eth.src"),
+        dst_mac=first("eth.dst"),
+    )
+
+    if "arp" in layers:
         info.protocol = "ARP"
-        info.arp = ArpInfo(
-            op=int(arp.op),
-            sender_ip=arp.psrc,
-            sender_mac=arp.hwsrc,
-            target_ip=arp.pdst,
-            target_mac=arp.hwdst,
-        )
+        arp = [first(f) for f in ("arp.opcode", "arp.src.proto_ipv4", "arp.src.hw_mac", "arp.dst.proto_ipv4", "arp.dst.hw_mac")]
+        if all(arp):  # non-IPv4 ARP has no addresses we can use
+            info.arp = ArpInfo(op=int(arp[0]), sender_ip=arp[1], sender_mac=arp[2], target_ip=arp[3], target_mac=arp[4])
         return info
 
-    if IP in pkt:
-        info.src_ip, info.dst_ip = pkt[IP].src, pkt[IP].dst
+    if "ip" in layers:
+        info.src_ip, info.dst_ip = first("ip.src"), first("ip.dst")
         info.protocol = "IPv4"
-    elif IPv6 in pkt:
-        info.src_ip, info.dst_ip = pkt[IPv6].src, pkt[IPv6].dst
-        info.protocol = "ICMPv6" if pkt[IPv6].nh == 58 else "IPv6"
+    elif "ipv6" in layers:
+        info.src_ip, info.dst_ip = first("ipv6.src"), first("ipv6.dst")
+        info.protocol = "ICMPv6" if "icmpv6" in layers else "IPv6"
 
-    if TCP in pkt:
-        tcp = pkt[TCP]
-        info.src_port, info.dst_port = int(tcp.sport), int(tcp.dport)
-        info.tcp_flags = str(tcp.flags)
+    if "tcp" in layers:
+        info.src_port, info.dst_port = int(first("tcp.srcport")), int(first("tcp.dstport"))
+        bits = int(first("tcp.flags"), 16)
+        info.tcp_flags = "".join(letter for i, letter in enumerate(TCP_FLAG_LETTERS) if bits & (1 << i))
         info.protocol = "TCP"
-    elif UDP in pkt:
-        udp = pkt[UDP]
-        info.src_port, info.dst_port = int(udp.sport), int(udp.dport)
+    elif "udp" in layers:
+        info.src_port, info.dst_port = int(first("udp.srcport")), int(first("udp.dstport"))
         info.protocol = "UDP"
-    elif ICMP in pkt:
+    elif "icmp" in layers:
         info.protocol = "ICMP"
 
-    if DNS in pkt:
-        info.dns = _dns_info(pkt[DNS])
+    if ("dns" in layers or "mdns" in layers) and first("dns.id"):
+        info.dns = DnsInfo(
+            id=int(first("dns.id"), 16),
+            is_response=first("dns.flags.response") in ("True", "1"),  # Wireshark 4.x prints True, 3.x prints 1
+            qname=first("dns.qry.name") or "",
+            answers=_answer_addresses(all_of),
+        )
         info.protocol = "DNS"
 
     return info
+
+
+def _answer_addresses(all_of) -> list[str]:
+    """A and AAAA addresses from the answer section only.
+
+    tshark lists the records of every section (answers, authority, additional) together,
+    in packet order. The first dns.count.answers records are the answers.
+    """
+    answers_count = int((all_of("dns.count.answers") or ["0"])[0])
+    a, aaaa = iter(all_of("dns.a")), iter(all_of("dns.aaaa"))
+    answers = []
+    for i, rr_type in enumerate(all_of("dns.resp.type")):
+        address = next(a, None) if rr_type == "1" else next(aaaa, None) if rr_type == "28" else None
+        if address is not None and i < answers_count:
+            answers.append(address)
+    return answers

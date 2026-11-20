@@ -1,7 +1,7 @@
 """Live mode (Phase 2, Part 1): run the engine on packets as they arrive.
 
 One session at a time. A background thread feeds packets to Session.handle_packet(),
-from a network interface or from a sample file (replay mode).
+from a network interface or from a sample file (replay mode). tshark decodes both.
 Each WebSocket client gets a snapshot every second. The feeding thread and the
 WebSocket loops share the engine through one lock.
 
@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
 import sys
 import threading
 import time
@@ -26,15 +27,10 @@ from pathlib import Path
 from fastapi import APIRouter, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
-from scapy.config import conf
-from scapy.error import Scapy_Exception
-from scapy.interfaces import get_working_ifaces
-from scapy.sendrecv import AsyncSniffer
-from scapy.supersocket import SuperSocket
-from scapy.utils import PcapReader, PcapWriter
 
+from .engine import tshark
 from .engine.engine import Engine
-from .engine.packet import to_packet_info
+from .engine.packet import PacketInfo
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 SAMPLES_DIR = BACKEND_DIR / "samples"
@@ -44,13 +40,12 @@ router = APIRouter()
 
 
 class Session:
-    def __init__(self, source: str, feed: Callable[[Session], None]) -> None:
-        self.source = source
+    def __init__(self, session_id: str, folder: Path, source: str, feed: Callable[[Session], None]) -> None:
+        self.id, self.folder, self.source = session_id, folder, source
+        self.pcap = folder / "capture.pcap"
         self.started_at = time.time()
-        self.id, self.folder = _new_session_folder()
         self.engine = Engine()
-        self.lock = threading.Lock()  # guards engine, writer and packets
-        self.writer = PcapWriter(str(self.folder / "capture.pcap"), sync=True)
+        self.lock = threading.Lock()  # guards engine and packets
         self.packets = 0
         self.stop_requested = threading.Event()
         self.error: str | None = None
@@ -62,11 +57,10 @@ class Session:
     def running(self) -> bool:
         return self.ended_at is None
 
-    def handle_packet(self, pkt) -> None:
+    def handle_packet(self, pkt: PacketInfo) -> None:
         with self.lock:
-            self.packets += 1  # frame number = position in capture.pcap, as in Wireshark
-            self.writer.write(pkt)
-            self.engine.process(to_packet_info(pkt, self.packets))
+            self.packets += 1
+            self.engine.process(pkt)  # pkt.number is tshark's frame number, the same as in capture.pcap
 
     def snapshot(self) -> dict:
         with self.lock:
@@ -82,9 +76,9 @@ class Session:
             feed(self)
         except Exception as exc:  # anything uncaught would leave the session stuck as "running"
             self.error = f"Capture stopped: {exc}"
+        self.stop_requested.set()  # also ends _capture's stop watcher when a capture failed by itself
         with self.lock:
             self.engine.finish()
-            self.writer.close()
             ended_at = time.time()
             saved = {
                 **self.engine.result(),
@@ -96,63 +90,63 @@ class Session:
             self.ended_at = ended_at  # set last, so "stopped" only goes out once result.json exists
 
 
-def _replay(session: Session, reader: PcapReader, speed: float) -> None:
-    """Feed a capture file at its recorded pace, `speed` times faster."""
-    previous: float | None = None
-    with reader:
-        for pkt in reader:
-            delay = 0.0 if previous is None else (float(pkt.time) - previous) / speed
-            previous = float(pkt.time)
+def _replay(session: Session, sample: Path, packets: list[PacketInfo], speed: float) -> None:
+    """Feed a decoded capture at its recorded pace, `speed` times faster."""
+    try:
+        previous: float | None = None
+        for pkt in packets:
+            delay = 0.0 if previous is None else (pkt.time - previous) / speed
+            previous = pkt.time
             if session.stop_requested.wait(max(delay, 0.0)):
                 return
             session.handle_packet(pkt)
-
-
-def _sniff(session: Session, sock: SuperSocket) -> None:
-    """Capture from an already-open interface until Stop is pressed or the capture fails."""
-    started = threading.Event()
-    sniffer = AsyncSniffer(opened_socket=sock, prn=session.handle_packet, store=False, started_callback=started.set)
-    sniffer.start()
-    try:
-        while not started.wait(0.05) and sniffer.thread.is_alive():
-            pass  # stop() only works once the capture loop is set up, a moment after start()
-        while sniffer.thread.is_alive() and not session.stop_requested.wait(0.5):
-            pass
-        if sniffer.thread.is_alive():
-            sniffer.stop(join=False)  # wakes the capture loop
-        sniffer.join()  # waits for it, and re-raises the error if the capture failed
     finally:
-        sock.close()
+        tshark.copy_frames(sample, session.pcap, session.packets)  # exactly the frames that were replayed
 
 
-def _open_interface(name: str) -> SuperSocket:
-    """Open the capture here, not in the sniffer thread, so a permission problem becomes a 403."""
-    if name not in {iface.name for iface in get_working_ifaces()}:
+def _capture(session: Session, capture: tshark.LiveCapture) -> None:
+    """Feed packets from a running tshark until Stop is pressed or the capture fails."""
+
+    def stop_when_asked() -> None:
+        session.stop_requested.wait()
+        capture.stop()
+
+    threading.Thread(target=stop_when_asked, daemon=True).start()
+    for pkt in capture.packets():
+        session.handle_packet(pkt)
+
+
+def _start_capture(name: str, pcap: Path) -> tshark.LiveCapture:
+    """Start tshark here, not in the session thread, so a permission problem becomes a 403."""
+    if name not in {iface["name"] for iface in tshark.interfaces()}:
         raise HTTPException(status_code=404, detail=f"No network interface named {name!r}.")
     try:
-        return conf.L2listen(iface=name)
-    except (OSError, Scapy_Exception) as exc:
-        # Linux raises PermissionError; macOS raises Scapy_Exception("Permission denied: ...").
-        if isinstance(exc, PermissionError) or "Permission denied" in str(exc):
+        return tshark.LiveCapture(name, pcap)
+    except tshark.TsharkError as exc:
+        if "permission" in str(exc).lower():
             raise HTTPException(status_code=403, detail=_permission_help(name)) from exc
         raise HTTPException(status_code=400, detail=f"Could not start capturing on {name} ({exc}).") from exc
 
 
 def _permission_help(name: str) -> str:
+    sudo = "restart the backend with sudo: sudo .venv/bin/uvicorn app.main:app --port 8000"
     if sys.platform == "win32":
         fix = "Install Npcap (it comes with Wireshark) and start the backend from an Administrator terminal."
+    elif sys.platform == "darwin":
+        fix = f"Install ChmodBPF from the Wireshark installer, or {sudo}"
     else:
-        fix = "Restart the backend with sudo: sudo .venv/bin/uvicorn app.main:app --port 8000"
-        if sys.platform == "darwin":
-            fix += " (or install ChmodBPF from the Wireshark installer to capture without sudo)."
+        fix = (
+            "Let your user capture with sudo dpkg-reconfigure wireshark-common (answer Yes), then "
+            f"sudo usermod -aG wireshark $USER and log in again. Or {sudo}"
+        )
     return f"Permission denied capturing on {name}. {fix}"
 
 
-def _open_sample(name: str) -> PcapReader:
+def _decode_sample(name: str) -> tuple[Path, list[PacketInfo]]:
     path = _file_inside(SAMPLES_DIR, name, f"No sample capture named {name!r} in backend/samples/.")
     try:
-        return PcapReader(str(path))
-    except (Scapy_Exception, EOFError) as exc:
+        return path, tshark.read_capture(path)
+    except tshark.TsharkError as exc:
         raise HTTPException(
             status_code=400,
             detail=f"Could not read {name} as a .pcap or .pcapng capture ({exc}).",
@@ -193,7 +187,7 @@ async def lifespan(app: FastAPI):
 
 @router.get("/api/interfaces")
 def interfaces() -> list[dict]:
-    return [{"name": i.name, "description": i.description, "ip": i.ip} for i in get_working_ifaces()]
+    return tshark.interfaces()
 
 
 class StartRequest(BaseModel):
@@ -217,11 +211,19 @@ def start(request: StartRequest) -> dict:
                 detail='Send either {"interface": "en0"} or {"replay": "mixed.pcapng"}.',
             )
         if request.interface is not None:
-            sock = _open_interface(request.interface)
-            session = Session(request.interface, lambda s: _sniff(s, sock))
+            session_id, folder = _new_session_folder()  # tshark writes capture.pcap straight into it
+            try:
+                capture = _start_capture(request.interface, folder / "capture.pcap")
+            except Exception:
+                shutil.rmtree(folder)  # nothing was captured
+                raise
+            session = Session(session_id, folder, request.interface, lambda s: _capture(s, capture))
         else:
-            reader = _open_sample(request.replay)
-            session = Session(f"{request.replay} (replay)", lambda s: _replay(s, reader, request.speed))
+            sample, packets = _decode_sample(request.replay)
+            session_id, folder = _new_session_folder()
+            session = Session(
+                session_id, folder, f"{request.replay} (replay)", lambda s: _replay(s, sample, packets, request.speed)
+            )
         _current = session
     return {"session_id": session.id}
 

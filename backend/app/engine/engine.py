@@ -9,12 +9,11 @@ from __future__ import annotations
 from dataclasses import asdict
 from pathlib import Path
 
-from scapy.utils import PcapReader
-
 from ..detectors import ALL_DETECTORS
 from .detector import Alert, Detector
-from .packet import PacketInfo, to_packet_info
+from .packet import PacketInfo
 from .stats import TrafficStats
+from .tshark import read_capture
 
 
 class Engine:
@@ -55,8 +54,7 @@ class Engine:
 def analyze_file(path: str | Path) -> dict:
     """Read a .pcap or .pcapng file and return everything the dashboard shows."""
     engine = Engine()
-    with PcapReader(str(path)) as reader:
-        for number, pkt in enumerate(reader, start=1):
-            engine.process(to_packet_info(pkt, number))
+    for pkt in read_capture(path):
+        engine.process(pkt)
     engine.finish()
     return engine.result()
